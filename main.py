@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
+import google.genai as genai
 from pydantic import BaseModel, Field
 
 
@@ -27,7 +27,7 @@ def load_dotenv() -> None:
 load_dotenv()
 
 DEFAULT_PROVIDER = os.getenv("AI_PROVIDER", "auto").lower()
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "")
 DEFAULT_HF_MODEL = os.getenv("HF_MODEL", "")
 
@@ -424,13 +424,18 @@ def analyze_with_provider(provider: str, symptoms: str) -> dict[str, str]:
 
 
 @app.post("/analyze")
-async def analyze_symptoms(data: PatientQuery) -> dict[str, str]:
+async def analyze_symptoms(data: PatientQuery) -> dict:
     errors: list[str] = []
     strings = messages_for(data.symptoms)
+    provider_order = get_provider_order()
 
-    for provider in get_provider_order():
+    for i, provider in enumerate(provider_order):
         try:
-            return analyze_with_provider(provider, data.symptoms)
+            result = analyze_with_provider(provider, data.symptoms)
+            # If we fell back past the first choice, include a warning
+            if i > 0 and errors:
+                result["warnings"] = " | ".join(errors)
+            return result
         except Exception as exc:
             errors.append(f"{provider}: {exc}")
 
@@ -440,14 +445,17 @@ async def analyze_symptoms(data: PatientQuery) -> dict[str, str]:
         "advice": " ; ".join(errors) if errors else "No providers available",
         "provider": "none",
         "model": "none",
+        "warnings": " | ".join(errors),
     }
 
 
 @app.get("/")
+@app.get("/health")
 def health() -> dict[str, object]:
     return {
         "status": "Medical AI Backend is online",
         "provider_mode": DEFAULT_PROVIDER,
+        "provider_order": get_provider_order(),
         "configured": {
             "gemini": gemini_available(),
             "openrouter": openrouter_available(),
@@ -456,7 +464,23 @@ def health() -> dict[str, object]:
         },
         "models": {
             "gemini": DEFAULT_GEMINI_MODEL,
-            "openrouter": DEFAULT_OPENROUTER_MODEL,
-            "huggingface": DEFAULT_HF_MODEL,
+            "openrouter": DEFAULT_OPENROUTER_MODEL or "(not set)",
+            "huggingface": DEFAULT_HF_MODEL or "(not set)",
         },
     }
+
+
+@app.get("/providers")
+def check_providers() -> dict[str, object]:
+    """Diagnostic endpoint: tests each configured provider and reports status."""
+    results: dict[str, object] = {}
+    test_symptoms = "I have a headache"
+
+    for provider in get_provider_order():
+        try:
+            res = analyze_with_provider(provider, test_symptoms)
+            results[provider] = {"status": "ok", "model": res.get("model", "?")}
+        except Exception as exc:
+            results[provider] = {"status": "error", "detail": str(exc)[:300]}
+
+    return {"providers": results, "order": get_provider_order()}
