@@ -6,7 +6,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import google.genai as genai
 from pydantic import BaseModel, Field
 
 
@@ -30,6 +29,7 @@ DEFAULT_PROVIDER = os.getenv("AI_PROVIDER", "auto").lower()
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 DEFAULT_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "")
 DEFAULT_HF_MODEL = os.getenv("HF_MODEL", "")
+ALLOW_LOCAL_FALLBACK = os.getenv("ALLOW_LOCAL_FALLBACK", "").lower() in {"1", "true", "yes", "on"}
 
 LANGUAGE_NAMES = {
     "ru": "Russian",
@@ -161,9 +161,19 @@ def build_system_prompt(symptoms: str) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(language_name=language_name)
 
 
-def parse_json_response(raw_text: str) -> dict[str, str]:
+def extract_json_object(raw_text: str) -> str:
     cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-    parsed = json.loads(cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("Model response does not contain a JSON object")
+
+    return cleaned[start : end + 1]
+
+
+def parse_json_response(raw_text: str) -> dict[str, str]:
+    parsed = json.loads(extract_json_object(raw_text))
 
     if not isinstance(parsed, dict):
         raise ValueError("Model response is not a JSON object")
@@ -249,12 +259,38 @@ def analyze_with_gemini(symptoms: str) -> dict[str, str]:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=DEFAULT_GEMINI_MODEL,
-        contents=f"{build_system_prompt(symptoms)}\n\n{build_user_prompt(symptoms)}",
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": (
+                            f"{build_system_prompt(symptoms)}\n\n"
+                            f"{build_user_prompt(symptoms)}"
+                        )
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+    response = post_json(
+        (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{DEFAULT_GEMINI_MODEL}:generateContent?key={api_key}"
+        ),
+        payload,
+        {},
     )
-    result = parse_json_response(response.text or "")
+    try:
+        raw_text = response["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected Gemini response: {response}") from exc
+
+    result = parse_json_response(raw_text)
     result = enforce_minimum_triage(symptoms, result)
     result["provider"] = "gemini"
     result["model"] = DEFAULT_GEMINI_MODEL
@@ -262,6 +298,7 @@ def analyze_with_gemini(symptoms: str) -> dict[str, str]:
 
 
 def post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     request = urllib.request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
@@ -270,11 +307,13 @@ def post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with opener.open(request, timeout=60) as response:
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {details}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Network error: {exc.reason}") from exc
 
     return json.loads(body)
 
@@ -397,6 +436,9 @@ def analyze_locally(symptoms: str) -> dict[str, str]:
 
 
 def get_provider_order() -> list[str]:
+    if DEFAULT_PROVIDER == "local":
+        return ["local"]
+
     if DEFAULT_PROVIDER != "auto":
         return [DEFAULT_PROVIDER]
 
@@ -407,7 +449,8 @@ def get_provider_order() -> list[str]:
         order.append("openrouter")
     if huggingface_available():
         order.append("huggingface")
-    order.append("local")
+    if ALLOW_LOCAL_FALLBACK:
+        order.append("local")
     return order
 
 
@@ -429,12 +472,21 @@ async def analyze_symptoms(data: PatientQuery) -> dict:
     strings = messages_for(data.symptoms)
     provider_order = get_provider_order()
 
+    if not provider_order:
+        return {
+            "color": "GRAY",
+            "reason": strings["error_reason"],
+            "advice": "No AI provider is configured. Set GEMINI_API_KEY or another external provider.",
+            "provider": "none",
+            "model": "none",
+            "warnings": ["No configured providers are available"],
+        }
+
     for i, provider in enumerate(provider_order):
         try:
             result = analyze_with_provider(provider, data.symptoms)
-            # If we fell back past the first choice, include a warning
             if i > 0 and errors:
-                result["warnings"] = " | ".join(errors)
+                result["warnings"] = errors.copy()
             return result
         except Exception as exc:
             errors.append(f"{provider}: {exc}")
@@ -442,10 +494,10 @@ async def analyze_symptoms(data: PatientQuery) -> dict:
     return {
         "color": "GRAY",
         "reason": strings["error_reason"],
-        "advice": " ; ".join(errors) if errors else "No providers available",
+        "advice": "Unable to get a verified AI response from the configured provider.",
         "provider": "none",
         "model": "none",
-        "warnings": " | ".join(errors),
+        "warnings": errors,
     }
 
 
@@ -460,7 +512,7 @@ def health() -> dict[str, object]:
             "gemini": gemini_available(),
             "openrouter": openrouter_available(),
             "huggingface": huggingface_available(),
-            "local": True,
+            "local": DEFAULT_PROVIDER == "local" or ALLOW_LOCAL_FALLBACK,
         },
         "models": {
             "gemini": DEFAULT_GEMINI_MODEL,
